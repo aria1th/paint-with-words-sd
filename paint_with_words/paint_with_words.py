@@ -2,38 +2,17 @@ import functools
 import inspect
 import math
 import os
-import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import PIL
 import torch
 import torch.nn.functional as F
-from diffusers import (
-    AutoencoderKL,
-    LMSDiscreteScheduler,
-    UNet2DConditionModel,
-)
+from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, BatchEncoding
-
-# https://stackoverflow.com/questions/21379163/how-to-silence-a-functions-output-to-console
-def _supress_print(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        # print inspect.getouterframes(inspect.currentframe())[3][3], func.__name__
-        if inspect.getouterframes(inspect.currentframe())[3][3] != "main":
-            stdout = sys.stdout
-            sys.stdout = open(os.devnull, "w")
-            val = func(*args, **kwargs)
-            sys.stdout = stdout
-            return val
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 def _img_importance_flatten(img: torch.Tensor, ratio: int) -> torch.Tensor:
@@ -112,7 +91,6 @@ def inj_forward(self, hidden_states, context=None, mask=None):
     return hidden_states
 
 
-@_supress_print
 def pww_load_tools(device: str = "cuda:0", scheduler_type=LMSDiscreteScheduler):
 
     vae = AutoencoderKL.from_pretrained(
@@ -176,14 +154,13 @@ def _image_context_seperator(  # Tuple[lists of Tuple[tokenized text, np.where o
     return ret_lists, w, h
 
 
-def _tokens_img_attention_bias( # lists of Tuple[tokenized text, np.where object of 'where toxenized text should apply']  + Global text + ratio + w_init
-    img_context_seperated: list[tuple[list[int], torch.Tensor]], tokenized_texts: BatchEncoding, ratio: int = 8, w_init:float = 0.4
+def _tokens_img_attention_weight( # lists of Tuple[tokenized text, np.where object of 'where toxenized text should apply']  + Global text + ratio
+    img_context_seperated: list[tuple[list[int], torch.Tensor]], tokenized_texts: BatchEncoding, ratio: int = 8
 ) -> torch.Tensor:  #
     """
     :param img_context_seperated: list[tuple[list[int], torch.Tensor]], Tensor has same size with image. list[int] is tokens.
     :param tokenized_texts: Global conditioning, BatchEncoding.
     :param ratio: Downscales with this ratio.
-    :param w_init: Just multiplier
     :return: Tensor that has property of {global token : flattened Tensor mask}. uses img_context_separated Tensor size -> returns w*h/r/r size tensors.
     """
 
@@ -207,7 +184,7 @@ def _tokens_img_attention_bias( # lists of Tuple[tokenized text, np.where object
 
         assert is_in == 1, f"token {img_v_as_tokens} not found in text"
 
-    return ret_tensor * w_init  # Now its just combinated w * h / (r**2) size- 'masks' that is resized from color-specific image. [[w*h/r/r flatten mask or 0] * global token length]
+    return ret_tensor  # Now its just combinated w * h / (r**2) size- 'masks' that is resized from color-specific image. [[w*h/r/r flatten mask or 0] * global token length]
     # Thus if image -> token is found in original(global) text, then it assumes there exists global token key mapping, [[mask] * global token length.]
 
 
@@ -222,7 +199,10 @@ def paint_with_words(
     seed: int = 0,
     scheduler_type=LMSDiscreteScheduler,
     device: str = "cuda:0",
-    weight_function: Callable = lambda w, sigma, qk: w * math.log(sigma + 1) * qk.max(),
+    weight_function: Callable = lambda w, sigma, qk: 0.3
+    * w
+    * math.log(sigma + 1)
+    * qk.max(),
     preloaded_utils: Optional[Tuple] = None,
 ):
 
@@ -246,16 +226,16 @@ def paint_with_words(
         color_map_image, color_context, tokenizer
     ) # Tuple[lists of Tuple[tokenized text, np.where object of 'where toxenized text should apply'] , width, height]
 
-    temp_cross_attention_bias_4096: torch.Tensor = _tokens_img_attention_bias(
+    cross_attention_weight_4096 = _tokens_img_attention_weight(
         seperated_word_contexts, text_input, ratio=8
-    ).to(device)  # w * h / 8**2
-    temp_cross_attention_bias_1024: torch.Tensor = _tokens_img_attention_bias(
+    ).to(device)
+    cross_attention_weight_1024 = _tokens_img_attention_weight(
         seperated_word_contexts, text_input, ratio=16
     ).to(device)
-    temp_cross_attention_bias_256: torch.Tensor = _tokens_img_attention_bias(
+    cross_attention_weight_256 = _tokens_img_attention_weight(
         seperated_word_contexts, text_input, ratio=32
     ).to(device)
-    temp_cross_attention_bias_64: torch.Tensor = _tokens_img_attention_bias(
+    cross_attention_weight_64 = _tokens_img_attention_weight(
         seperated_word_contexts, text_input, ratio=64
     ).to(device)
 
@@ -291,10 +271,10 @@ def paint_with_words(
             t,
             encoder_hidden_states={
                 "CONTEXT_TENSOR": cond_embeddings,
-                "CROSS_ATTENTION_WEIGHT_4096": temp_cross_attention_bias_4096,
-                "CROSS_ATTENTION_WEIGHT_1024": temp_cross_attention_bias_1024,
-                "CROSS_ATTENTION_WEIGHT_256": temp_cross_attention_bias_256,
-                "CROSS_ATTENTION_WEIGHT_64": temp_cross_attention_bias_64,
+                "CROSS_ATTENTION_WEIGHT_4096": cross_attention_weight_4096,
+                "CROSS_ATTENTION_WEIGHT_1024": cross_attention_weight_1024,
+                "CROSS_ATTENTION_WEIGHT_256": cross_attention_weight_256,
+                "CROSS_ATTENTION_WEIGHT_64": cross_attention_weight_64,
                 "SIGMA": sigma,
                 "WEIGHT_FUNCTION": weight_function,
             },
