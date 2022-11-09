@@ -12,10 +12,15 @@ from diffusers import AutoencoderKL, LMSDiscreteScheduler, UNet2DConditionModel
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, BatchEncoding
 
 
-def _img_importance_flatten(img: torch.tensor, ratio: int) -> torch.tensor:
+def _img_importance_flatten(img: torch.Tensor, ratio: int) -> torch.Tensor:
+    '''
+    :param img: torch.Tensor
+    :param ratio: int (multiplier). Image or Tensor will be upscaled by this factor.
+    :return: torch.Tensor (flatten), returns flattened version of scaled Tensor.
+    '''
     return F.interpolate(
         img.unsqueeze(0).unsqueeze(1),
         scale_factor=1 / ratio,
@@ -121,59 +126,66 @@ def pww_load_tools(device: str = "cuda:0", scheduler_type=LMSDiscreteScheduler):
     return vae, unet, text_encoder, tokenizer, scheduler
 
 
-def _image_context_seperator(
-    img: Image.Image, color_context: dict, _tokenizer
-) -> List[Tuple[List[int], torch.Tensor]]:
+def _image_context_seperator(  # Tuple[lists of Tuple[tokenized text, np.where object of 'where toxenized text should apply'] , width, height]
+    img: np.ndarray | Image.Image, color_context: dict[tuple[int,int,int],str], _tokenizer: CLIPTokenizer
+) -> Tuple[list[tuple[list[int], torch.Tensor]], int, int]:
     w, h = img.size
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
     img = img.resize((w, h), resample=PIL.Image.LANCZOS)
 
-    ret_lists = []
+    ret_lists: list[tuple[list[int], torch.Tensor]] = []
     for color, v in color_context.items():
+        img_where_color = (np.array(img) == color).all(axis=-1)
+        if img_where_color.mean() == 0:
+            print(f"Cannot find color {color} in given image, skipping...")
+            continue
         v, f = v.split(",")
         f = float(f)
-        v_input = _tokenizer(
+        v_input: BatchEncoding = _tokenizer(
             v,
             max_length=_tokenizer.model_max_length,
             truncation=True,
         )
-        v_as_tokens = v_input["input_ids"][1:-1]
-
-        img_where_color = (np.array(img) == color).all(axis=-1)
-        assert (
-            img_where_color.sum() > 0
-        ), f"not a single color {color} not found in image"
-        img_where_color = torch.tensor(img_where_color, dtype=torch.float32) * f
+        v_as_tokens: list[int] = v_input["input_ids"][1:-1]
+        img_where_color = torch.tensor(img_where_color, dtype=torch.float32) * f  # Its now array mask!
 
         ret_lists.append((v_as_tokens, img_where_color))
 
     return ret_lists, w, h
 
 
-def _tokens_img_attention_weight(
-    img_context_seperated, tokenized_texts, ratio: int = 8
-):
+def _tokens_img_attention_weight( # lists of Tuple[tokenized text, np.where object of 'where toxenized text should apply']  + Global text + ratio
+    img_context_seperated: list[tuple[list[int], torch.Tensor]], tokenized_texts: BatchEncoding, ratio: int = 8
+) -> torch.Tensor:  #
+    """
+    :param img_context_seperated: list[tuple[list[int], torch.Tensor]], Tensor has same size with image. list[int] is tokens.
+    :param tokenized_texts: Global conditioning, BatchEncoding.
+    :param ratio: Downscales with this ratio.
+    :return: Tensor that has property of {global token : flattened Tensor mask}. uses img_context_separated Tensor size -> returns w*h/r/r size tensors.
+    """
 
-    token_lis = tokenized_texts["input_ids"][0].tolist()
+    glob_token_lis:list[int] = tokenized_texts["input_ids"][0].tolist()
     w, h = img_context_seperated[0][1].shape
 
     w_r, h_r = w // ratio, h // ratio
+    assert w % ratio == 0 and h % ratio == 0, f"Shape{(w,h)} cannot be divided with {ratio}!"
 
-    ret_tensor = torch.zeros((w_r * h_r, len(token_lis)), dtype=torch.float32)
+    ret_tensor = torch.zeros((w_r * h_r, len(glob_token_lis)), dtype=torch.float32)  # per-token bias, flatten the array.
 
-    for v_as_tokens, img_where_color in img_context_seperated:
+    for img_v_as_tokens, img_where_color in img_context_seperated:
         is_in = 0
 
-        for idx, tok in enumerate(token_lis):
-            if tok in v_as_tokens:
+        for idx, tok in enumerate(glob_token_lis):
+            if tok in img_v_as_tokens:
                 is_in = 1
                 ret_tensor[:, idx] += _img_importance_flatten(
-                    img_where_color, ratio
-                ).reshape(-1)
+                    img_where_color, ratio  # img_where_color is 0-1 mask. per-token bias, apply mask. apply more ratio if patch size is small (for 2d, its square)
+                ).reshape(-1) # result has w_r * h_r size.
 
-        assert is_in == 1, f"token {v_as_tokens} not found in text"
+        assert is_in == 1, f"token {img_v_as_tokens} not found in text"
 
-    return ret_tensor
+    return ret_tensor  # Now its just combinated w * h / (r**2) size- 'masks' that is resized from color-specific image. [[w*h/r/r flatten mask or 0] * global token length]
+    # Thus if image -> token is found in original(global) text, then it assumes there exists global token key mapping, [[mask] * global token length.]
 
 
 @torch.no_grad()
@@ -202,7 +214,7 @@ def paint_with_words(
 
     generator = torch.manual_seed(seed)
 
-    text_input = tokenizer(
+    text_input: BatchEncoding = tokenizer(
         [input_prompt],
         padding="max_length",
         max_length=tokenizer.model_max_length,
@@ -212,7 +224,7 @@ def paint_with_words(
 
     seperated_word_contexts, width, height = _image_context_seperator(
         color_map_image, color_context, tokenizer
-    )
+    ) # Tuple[lists of Tuple[tokenized text, np.where object of 'where toxenized text should apply'] , width, height]
 
     cross_attention_weight_4096 = _tokens_img_attention_weight(
         seperated_word_contexts, text_input, ratio=8
